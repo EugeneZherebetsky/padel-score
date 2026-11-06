@@ -1,0 +1,664 @@
+<template>
+  <div class="container">
+    <!-- VIEW 1: LIVE SCOREBOARD -->
+    <div class="board" if="{{ !showLog }}">
+      <!-- Top: screen on/off -->
+      <div class="top-btn scr-on" if="{{ keepAwake }}" onclick="toggleKeepAwake">
+        <text class="top-btn-text">SCREEN ON</text>
+      </div>
+      <div class="top-btn scr-off" else onclick="toggleKeepAwake">
+        <text class="top-btn-text">SCREEN OFF</text>
+      </div>
+
+      <!-- Match info (tap at 0-0 to swap first server) -->
+      <div class="info" onclick="swapInitialServer">
+        <text class="banner-text" if="{{ banner }}">{{ banner }}</text>
+        <div class="info-col" else>
+          <text class="sets-text">SETS {{ setsA }} - {{ setsB }}</text>
+          <text class="games-text">{{ gamesLabel }}</text>
+        </div>
+      </div>
+
+      <!-- Team A (Us) - blue -->
+      <div class="score-zone team-us" onclick="addPoint('A')">
+        <div class="team-info">
+          <text class="team-label">US</text>
+          <text class="serve-badge" if="{{ currentServer === 'A' }}">SRV {{ serveSide }}</text>
+        </div>
+        <text class="point-text">{{ displayPointA }}</text>
+      </div>
+
+      <!-- Team B (Them) - red -->
+      <div class="score-zone team-them" onclick="addPoint('B')">
+        <div class="team-info">
+          <text class="team-label">THEM</text>
+          <text class="serve-badge" if="{{ currentServer === 'B' }}">SRV {{ serveSide }}</text>
+        </div>
+        <text class="point-text">{{ displayPointB }}</text>
+      </div>
+
+      <!-- Bottom: Undo & History -->
+      <div class="footer">
+        <div class="btn btn-undo" onclick="undo">
+          <text class="btn-text">UNDO</text>
+        </div>
+        <div class="btn btn-hist" onclick="toggleLog">
+          <text class="btn-text">HISTORY</text>
+        </div>
+      </div>
+    </div>
+
+    <!-- VIEW 2: LAST 10 MATCHES LOG -->
+    <div class="log-view" else>
+      <div class="log-header">
+        <text class="log-title">HISTORY ({{ matchLog.length }})</text>
+      </div>
+
+      <div class="empty-box" if="{{ matchLog.length === 0 }}">
+        <text class="empty-text">No matches yet</text>
+      </div>
+
+      <!-- Plain scroll + divs: <list> rendered blank on the band -->
+      <scroll class="log-scroll" scroll-y="true" else>
+        <div class="log-item" for="{{ matchLog }}">
+          <div class="log-row">
+            <text class="log-date">{{ $item.date }}</text>
+            <text class="log-res">{{ $item.result }}</text>
+          </div>
+          <div class="log-row">
+            <text class="log-time">{{ $item.time }}</text>
+            <text class="log-dur">{{ $item.duration }}</text>
+          </div>
+          <text class="log-sets">Sets {{ $item.sets }}</text>
+          <text class="log-scores">{{ $item.scores }}</text>
+        </div>
+      </scroll>
+
+      <div class="new-btn" onlongpress="newMatch">
+        <text class="btn-text">HOLD: NEW MATCH</text>
+      </div>
+
+      <div class="footer">
+        <div class="btn btn-undo" onclick="toggleLog">
+          <text class="btn-text">BACK</text>
+        </div>
+        <div class="btn btn-clear" onlongpress="clearMatchLog">
+          <text class="btn-text">HOLD CLEAR</text>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script>
+import vibrator from '@system.vibrator'
+import brightness from '@system.brightness'
+import storage from '@system.storage'
+
+// Golden point is always on: no AD score
+const POINT_LABELS = ['0', '15', '30', '40']
+const STORAGE_KEY = 'padel_match_state_v3'
+const MAX_UNDO = 30
+const MAX_LOG = 10
+const SETS_TO_WIN = 2 // best of 3
+const BANNER_MS = 4000
+
+// Undo snapshots are kept outside reactive data and not saved to flash.
+let undoStack = []
+let bannerTimer = null
+
+function otherTeam(t) {
+  return t === 'A' ? 'B' : 'A'
+}
+
+function pad2(n) {
+  return n < 10 ? '0' + n : String(n)
+}
+
+function formatDate(d) {
+  return `${pad2(d.getDate())}.${pad2(d.getMonth() + 1)}.${d.getFullYear()}`
+}
+
+function formatTime(d) {
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+}
+
+function formatDuration(ms) {
+  const totalMin = Math.max(0, Math.round(ms / 60000))
+  const h = Math.floor(totalMin / 60)
+  const m = totalMin % 60
+  return h > 0 ? `${h}h ${pad2(m)}m` : `${m} min`
+}
+
+// Every field the history template shows must be a string; older entries
+// stored "dd/mm hh:mm" in `date` and had no time/duration.
+function normalizeLogEntry(e) {
+  const item = (e && typeof e === 'object') ? e : {}
+  let date = typeof item.date === 'string' ? item.date : ''
+  let time = typeof item.time === 'string' ? item.time : ''
+  if (!time && date.indexOf(' ') > 0) {
+    time = date.slice(date.indexOf(' ') + 1)
+    date = date.slice(0, date.indexOf(' '))
+  }
+  return {
+    date: date || '--',
+    time: time || '--:--',
+    duration: typeof item.duration === 'string' ? item.duration : '',
+    result: typeof item.result === 'string' ? item.result : '',
+    sets: typeof item.sets === 'string' ? item.sets : '',
+    scores: typeof item.scores === 'string' ? item.scores : ''
+  }
+}
+
+function wonSet(g, other) {
+  // 6-x with a 2-game lead, 7-5, or 7-6 after the tie-break
+  return (g >= 6 && g - other >= 2) || (g === 7 && other === 6)
+}
+
+export default {
+  private: {
+    // Match state (saved to storage)
+    pointsA: 0,
+    pointsB: 0,
+    gamesA: 0,
+    gamesB: 0,
+    setsA: 0,
+    setsB: 0,
+    currentSetScores: [],
+    rawPointsInGame: 0,
+    baseServer: 'A',
+    matchStart: 0, // ms timestamp of the first point, 0 = not started
+    keepAwake: true,
+    matchLog: [],
+
+    // UI-only state
+    showLog: false,
+    banner: '',
+
+    // Derived display values, recalculated by syncView()
+    isTieBreak: false,
+    gamesLabel: 'GAMES 0 - 0',
+    displayPointA: '0',
+    displayPointB: '0',
+    currentServer: 'A',
+    serveSide: 'R'
+  },
+
+  onInit() {
+    this.syncView()
+    this.loadFromStorage()
+  },
+
+  onShow() {
+    this.applyKeepAwake()
+  },
+
+  onHide() {
+    this.releaseKeepAwake()
+  },
+
+  onDestroy() {
+    this.releaseKeepAwake()
+    if (bannerTimer) {
+      clearTimeout(bannerTimer)
+      bannerTimer = null
+    }
+  },
+
+  // ---------- Screen wake ----------
+
+  applyKeepAwake() {
+    brightness.setKeepScreenOn({
+      keepScreenOn: this.keepAwake,
+      fail: (data, code) => console.error(`setKeepScreenOn failed: ${code} ${data}`)
+    })
+  },
+
+  releaseKeepAwake() {
+    brightness.setKeepScreenOn({
+      keepScreenOn: false,
+      fail: (data, code) => console.error(`setKeepScreenOn(false) failed: ${code} ${data}`)
+    })
+  },
+
+  toggleKeepAwake() {
+    this.keepAwake = !this.keepAwake
+    this.applyKeepAwake()
+    vibrator.vibrate({ mode: 'short' })
+    this.persistToStorage()
+  },
+
+  // ---------- Derived view values ----------
+
+  syncView() {
+    const tb = this.gamesA === 6 && this.gamesB === 6
+    this.isTieBreak = tb
+    this.gamesLabel = tb ? 'TIE-BREAK' : `GAMES ${this.gamesA} - ${this.gamesB}`
+    this.displayPointA = tb ? String(this.pointsA) : POINT_LABELS[this.pointsA]
+    this.displayPointB = tb ? String(this.pointsB) : POINT_LABELS[this.pointsB]
+
+    if (tb) {
+      const totalPts = this.pointsA + this.pointsB
+      // First point by baseServer, then serve alternates every two points
+      const turnGroup = Math.floor((totalPts + 1) / 2)
+      this.currentServer = (turnGroup % 2 === 0) ? this.baseServer : otherTeam(this.baseServer)
+      this.serveSide = (totalPts % 2 === 0) ? 'R' : 'L'
+    } else {
+      this.currentServer = this.baseServer
+      this.serveSide = (this.rawPointsInGame % 2 === 0) ? 'R' : 'L'
+    }
+  },
+
+  showBanner(text) {
+    this.banner = text
+    if (bannerTimer) clearTimeout(bannerTimer)
+    bannerTimer = setTimeout(() => {
+      this.banner = ''
+      bannerTimer = null
+    }, BANNER_MS)
+  },
+
+  // ---------- Persistence ----------
+
+  persistToStorage() {
+    const payload = JSON.stringify({
+      pointsA: this.pointsA,
+      pointsB: this.pointsB,
+      gamesA: this.gamesA,
+      gamesB: this.gamesB,
+      setsA: this.setsA,
+      setsB: this.setsB,
+      currentSetScores: this.currentSetScores,
+      rawPointsInGame: this.rawPointsInGame,
+      baseServer: this.baseServer,
+      matchStart: this.matchStart,
+      keepAwake: this.keepAwake,
+      matchLog: this.matchLog
+    })
+    storage.set({
+      key: STORAGE_KEY,
+      value: payload,
+      fail: (data, code) => console.error(`storage.set failed: ${code} ${data}`)
+    })
+  },
+
+  loadFromStorage() {
+    storage.get({
+      key: STORAGE_KEY,
+      default: '',
+      success: (data) => {
+        if (data) {
+          try {
+            this.applySavedState(JSON.parse(data))
+          } catch (e) {
+            console.error(`Saved state is corrupted, resetting: ${e}`)
+            this.clearMatchState()
+            this.persistToStorage()
+          }
+        }
+        this.syncView()
+        this.applyKeepAwake()
+      },
+      fail: (data, code) => {
+        console.error(`storage.get failed: ${code} ${data}`)
+        this.applyKeepAwake()
+      }
+    })
+  },
+
+  applySavedState(parsed) {
+    const num = (v, max) => (typeof v === 'number' && v >= 0) ? Math.min(Math.floor(v), max) : 0
+    this.gamesA = num(parsed.gamesA, 7)
+    this.gamesB = num(parsed.gamesB, 7)
+    const tb = this.gamesA === 6 && this.gamesB === 6
+    // Outside a tie-break points are indices into POINT_LABELS (0..3); an old AD (4) becomes 40
+    this.pointsA = num(parsed.pointsA, tb ? 99 : 3)
+    this.pointsB = num(parsed.pointsB, tb ? 99 : 3)
+    this.setsA = num(parsed.setsA, SETS_TO_WIN - 1)
+    this.setsB = num(parsed.setsB, SETS_TO_WIN - 1)
+    this.currentSetScores = Array.isArray(parsed.currentSetScores) ? parsed.currentSetScores : []
+    this.rawPointsInGame = num(parsed.rawPointsInGame, 999)
+    this.baseServer = parsed.baseServer === 'B' ? 'B' : 'A'
+    this.matchStart = num(parsed.matchStart, Number.MAX_SAFE_INTEGER)
+    if (typeof parsed.keepAwake === 'boolean') this.keepAwake = parsed.keepAwake
+    const log = Array.isArray(parsed.matchLog) ? parsed.matchLog.slice(0, MAX_LOG) : []
+    this.matchLog = log.map(normalizeLogEntry)
+  },
+
+  // ---------- Undo ----------
+
+  saveState() {
+    undoStack.push({
+      pA: this.pointsA, pB: this.pointsB,
+      gA: this.gamesA, gB: this.gamesB,
+      sA: this.setsA, sB: this.setsB,
+      setScores: this.currentSetScores.slice(),
+      rawPts: this.rawPointsInGame,
+      start: this.matchStart,
+      srv: this.baseServer,
+      // matchLog is replaced (never mutated) when a match is saved,
+      // so keeping the old reference lets undo remove an auto-saved match
+      log: this.matchLog
+    })
+    if (undoStack.length > MAX_UNDO) undoStack.shift()
+  },
+
+  undo() {
+    if (undoStack.length === 0) return
+    const last = undoStack.pop()
+    this.pointsA = last.pA
+    this.pointsB = last.pB
+    this.gamesA = last.gA
+    this.gamesB = last.gB
+    this.setsA = last.sA
+    this.setsB = last.sB
+    this.currentSetScores = last.setScores
+    this.rawPointsInGame = last.rawPts
+    this.baseServer = last.srv
+    this.matchStart = last.start || 0
+    this.matchLog = last.log
+    if (bannerTimer) {
+      clearTimeout(bannerTimer)
+      bannerTimer = null
+    }
+    this.banner = ''
+    this.syncView()
+    vibrator.vibrate({ mode: 'short' })
+    this.persistToStorage()
+  },
+
+  // ---------- Scoring ----------
+
+  addPoint(team) {
+    this.saveState()
+    vibrator.vibrate({ mode: 'short' })
+    if (!this.matchStart) this.matchStart = Date.now()
+    this.rawPointsInGame++
+
+    const isTeamA = (team === 'A')
+    if (this.isTieBreak) {
+      this.resolveTieBreakPoint(isTeamA)
+    } else {
+      this.resolveRegularPoint(isTeamA)
+    }
+
+    if (this.setsA >= SETS_TO_WIN || this.setsB >= SETS_TO_WIN) {
+      this.finishMatch()
+    }
+    this.syncView()
+    this.persistToStorage()
+  },
+
+  resolveTieBreakPoint(isTeamA) {
+    if (isTeamA) {
+      this.pointsA++
+      if (this.pointsA >= 7 && (this.pointsA - this.pointsB) >= 2) this.winGame(true)
+    } else {
+      this.pointsB++
+      if (this.pointsB >= 7 && (this.pointsB - this.pointsA) >= 2) this.winGame(false)
+    }
+  },
+
+  resolveRegularPoint(isTeamA) {
+    // Golden point: whoever wins the point at 40 wins the game, including 40-40
+    const p = isTeamA ? this.pointsA : this.pointsB
+    if (p === 3) {
+      this.winGame(isTeamA)
+    } else if (isTeamA) {
+      this.pointsA++
+    } else {
+      this.pointsB++
+    }
+  },
+
+  winGame(isTeamA) {
+    vibrator.vibrate({ mode: 'long' })
+    this.pointsA = 0
+    this.pointsB = 0
+    this.rawPointsInGame = 0
+    this.baseServer = otherTeam(this.baseServer)
+
+    if (isTeamA) this.gamesA++
+    else this.gamesB++
+
+    if (wonSet(this.gamesA, this.gamesB)) {
+      this.setsA++
+      this.finishSet()
+    } else if (wonSet(this.gamesB, this.gamesA)) {
+      this.setsB++
+      this.finishSet()
+    }
+  },
+
+  finishSet() {
+    this.currentSetScores.push(`${this.gamesA}-${this.gamesB}`)
+    this.gamesA = 0
+    this.gamesB = 0
+  },
+
+  finishMatch() {
+    const won = this.setsA > this.setsB
+    const sets = `${this.setsA}-${this.setsB}`
+    this.recordCurrentMatchToLog()
+    this.clearMatchState()
+    this.showBanner(won ? `WON ${sets}` : `LOST ${sets}`)
+  },
+
+  // ---------- Match log ----------
+
+  recordCurrentMatchToLog() {
+    const end = Date.now()
+    const start = this.matchStart || end
+    const startDate = new Date(start)
+
+    const allScores = this.currentSetScores.slice()
+    if (this.gamesA > 0 || this.gamesB > 0) {
+      allScores.push(`${this.gamesA}-${this.gamesB}`)
+    }
+
+    // Finished matches are decided by sets; an ended-early match falls back to games
+    let result = 'DRAW'
+    if (this.setsA > this.setsB || (this.setsA === this.setsB && this.gamesA > this.gamesB)) {
+      result = 'WIN'
+    } else if (this.setsB > this.setsA || (this.setsA === this.setsB && this.gamesB > this.gamesA)) {
+      result = 'LOSS'
+    }
+
+    // Build a new array (never mutate) so undo snapshots keep the previous log
+    const log = [{
+      date: formatDate(startDate),
+      time: formatTime(startDate),
+      duration: formatDuration(end - start),
+      result: result,
+      sets: `${this.setsA}-${this.setsB}`,
+      scores: allScores.join('  ')
+    }].concat(this.matchLog)
+    this.matchLog = log.slice(0, MAX_LOG)
+  },
+
+  // ---------- Controls ----------
+
+  swapInitialServer() {
+    if (this.pointsA === 0 && this.pointsB === 0) {
+      this.baseServer = otherTeam(this.baseServer)
+      this.syncView()
+      vibrator.vibrate({ mode: 'short' })
+      this.persistToStorage()
+    }
+  },
+
+  // Long-press on the history screen: end the current match early and start fresh.
+  // A match with at least one game played is saved to history; UNDO can restore it.
+  newMatch() {
+    this.saveState()
+    const played = this.setsA > 0 || this.setsB > 0 || this.gamesA > 0 || this.gamesB > 0
+    if (played) this.recordCurrentMatchToLog()
+    this.clearMatchState()
+    this.showLog = false
+    this.syncView()
+    this.showBanner('NEW MATCH')
+    vibrator.vibrate({ mode: 'long' })
+    this.persistToStorage()
+  },
+
+  toggleLog() {
+    this.showLog = !this.showLog
+    vibrator.vibrate({ mode: 'short' })
+  },
+
+  clearMatchLog() {
+    this.matchLog = []
+    undoStack = []
+    vibrator.vibrate({ mode: 'long' })
+    this.persistToStorage()
+  },
+
+  clearMatchState() {
+    this.pointsA = 0
+    this.pointsB = 0
+    this.gamesA = 0
+    this.gamesB = 0
+    this.setsA = 0
+    this.setsB = 0
+    this.currentSetScores = []
+    this.rawPointsInGame = 0
+    this.baseServer = 'A'
+    this.matchStart = 0
+  }
+}
+</script>
+
+<style>
+.container {
+  flex-direction: column;
+  width: 212px;
+  height: 520px;
+  background-color: #000000;
+}
+.board, .log-view {
+  flex: 1;
+  flex-direction: column;
+  padding-left: 6px;
+  padding-right: 6px;
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+/* Top screen on/off button */
+.top-btn {
+  height: 48px;
+  border-radius: 24px;
+  justify-content: center;
+  align-items: center;
+}
+.scr-on { background-color: #065f46; }
+.scr-off { background-color: #374151; }
+.top-btn-text { color: #ffffff; font-size: 16px; font-weight: bold; }
+
+/* Sets / games info */
+.info {
+  height: 70px;
+  justify-content: center;
+  align-items: center;
+}
+.info-col {
+  flex-direction: column;
+  align-items: center;
+}
+.sets-text { color: #9ca3af; font-size: 18px; }
+.games-text { color: #ffffff; font-size: 22px; font-weight: bold; }
+.banner-text { color: #facc15; font-size: 26px; font-weight: bold; }
+
+/* Score zones */
+.score-zone {
+  flex: 1;
+  flex-direction: row;
+  justify-content: space-between;
+  align-items: center;
+  border-radius: 20px;
+  margin-bottom: 8px;
+  padding-left: 14px;
+  padding-right: 14px;
+}
+.team-us { background-color: #1d4ed8; }
+.team-them { background-color: #b91c1c; }
+.team-info {
+  flex-direction: column;
+  justify-content: center;
+}
+.team-label { color: #ffffff; font-size: 22px; font-weight: bold; }
+.serve-badge { color: #facc15; font-size: 18px; font-weight: bold; margin-top: 4px; }
+.point-text { color: #ffffff; font-size: 56px; font-weight: bold; }
+
+/* Bottom buttons */
+.footer {
+  flex-direction: row;
+  height: 64px;
+}
+.btn {
+  flex: 1;
+  justify-content: center;
+  align-items: center;
+  border-radius: 14px;
+  margin-left: 2px;
+  margin-right: 2px;
+}
+.btn-undo { background-color: #374151; }
+.btn-hist { background-color: #1f2937; }
+.btn-clear { background-color: #7f1d1d; }
+.new-btn {
+  height: 52px;
+  border-radius: 14px;
+  justify-content: center;
+  align-items: center;
+  background-color: #065f46;
+  margin-left: 2px;
+  margin-right: 2px;
+  margin-bottom: 8px;
+}
+.btn-text { color: #ffffff; font-size: 15px; font-weight: bold; }
+
+/* History view */
+/* Explicit sizes: 520 tall - 20 padding - 50 header - 60 new btn - 64 footer = 326 */
+.log-header {
+  height: 50px;
+  justify-content: center;
+  align-items: center;
+}
+.log-title { color: #f59e0b; font-size: 18px; font-weight: bold; }
+.empty-box {
+  height: 318px;
+  margin-bottom: 8px;
+  justify-content: center;
+  align-items: center;
+}
+.empty-text { color: #6b7280; font-size: 16px; }
+.log-scroll {
+  width: 200px;
+  height: 318px;
+  margin-bottom: 8px;
+  flex-direction: column;
+}
+.log-item {
+  width: 196px;
+  margin-left: 2px;
+  flex-direction: column;
+  background-color: #111827;
+  border-radius: 14px;
+  padding-left: 12px;
+  padding-right: 12px;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  margin-bottom: 8px;
+}
+.log-row {
+  flex-direction: row;
+  justify-content: space-between;
+}
+.log-date { color: #ffffff; font-size: 15px; font-weight: bold; }
+.log-res { color: #facc15; font-size: 15px; font-weight: bold; }
+.log-time { color: #9ca3af; font-size: 14px; }
+.log-dur { color: #9ca3af; font-size: 14px; }
+.log-sets { color: #ffffff; font-size: 16px; font-weight: bold; margin-top: 4px; }
+.log-scores { color: #34d399; font-size: 16px; margin-top: 2px; }
+</style>

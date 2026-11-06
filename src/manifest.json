@@ -1,0 +1,33 @@
+{
+  "package": "com.custom.padelscore",
+  "name": "ПАДЛЫ",
+  "versionName": "1.6.0",
+  "versionCode": 8,
+  "minPlatformVersion": 1000,
+  "deviceTypeList": [
+    "watch"
+  ],
+  "icon": "/common/logo.png",
+  "features": [
+    {
+      "name": "system.vibrator"
+    },
+    {
+      "name": "system.brightness"
+    },
+    {
+      "name": "system.storage"
+    }
+  ],
+  "config": {
+    "designWidth": 212
+  },
+  "router": {
+    "entry": "pages/index",
+    "pages": {
+      "pages/index": {
+        "component": "index"
+      }
+    }
+  }
+}
