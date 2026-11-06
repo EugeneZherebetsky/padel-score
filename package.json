@@ -16,6 +16,10 @@
     "aiot-toolkit": "^2.0.5"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC"
+  "author": "EugeneZherebetsky",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EugeneZherebetsky/padel-score.git"
+  }
 }

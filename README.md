@@ -1,4 +1,4 @@
-# ПАДЛЫ (Padel Score) — Xiaomi Smart Band 10
+# Padel_score — Xiaomi Smart Band 10
 
 Padel score tracker built as a Xiaomi Vela JS quick app (212×520 screen).
 
@@ -22,3 +22,6 @@ Copy the `.rpk` to an Android phone and sideload it with Notify for Xiaomi.
 
 ## Notes
 - Keep `src/common/logo.png` small (80×80 round PNG with transparent corners, a few KB). A 1254×1254 icon made the band reboot-loop.
+
+## License
+[ISC](LICENSE)
